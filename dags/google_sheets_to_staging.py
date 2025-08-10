@@ -28,7 +28,6 @@ dag = DAG(
     catchup=False,
     tags=['google_sheets', 'test', 'csv'],
 )
-
 def read_google_sheet_csv(**context):
     """
     Read Google Sheets by exporting to CSV, add timestamp column,
@@ -55,6 +54,12 @@ def read_google_sheet_csv(**context):
         processed_data.append(row)
 
     print(f"Successfully read {len(processed_data)} non-empty rows from Google Sheets")
+
+    # 🔹 Show top 5 rows as preview
+    preview = processed_data[:5]
+    print("Preview of first 5 records:")
+    for i, row in enumerate(preview, start=1):
+        print(f"{i}: {row}")
 
     # Ensure data folder exists inside DAGs folder
     save_dir = "/opt/airflow/dags/data"
