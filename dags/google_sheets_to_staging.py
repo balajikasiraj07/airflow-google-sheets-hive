@@ -1,110 +1,100 @@
 from datetime import datetime, timedelta
+import json
+import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-import requests
-import csv
-import io
+from airflow.models import Variable
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import os
-import json
-import pytz
 
-# Default arguments for the DAG
+# Default args
 default_args = {
-    'owner': 'balaji',
-    'depends_on_past': False,
-    'start_date': datetime(2025, 8, 9),  # Must be in the past
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    "owner": "airflow",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
 }
 
-# Create the DAG
-dag = DAG(
-    'simple_google_sheets_test',
+# DAG definition
+with DAG(
+    dag_id="google_sheets_to_hive",
     default_args=default_args,
-    description='Simple test to read Google Sheets via CSV export',
-    schedule_interval=timedelta(hours=1),
+    description="Read Google Sheet → save JSON → process data",
+    schedule_interval=None,
+    start_date=datetime(2024, 8, 1),
     catchup=False,
-    tags=['google_sheets', 'test', 'csv'],
-)
-def read_google_sheet_csv(**context):
-    """
-    Read Google Sheets by exporting to CSV, add timestamp column,
-    skip empty rows, and save to known folder.
-    """
-    sheet_id = '16Bt5nIVHJC9M4F-OgoQg7OTQeXANqk7gwfHVMHsVpTE'
-    csv_url = f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid=0'
-    
-    print(f"Attempting to read from: {csv_url}")
-    response = requests.get(csv_url)
-    response.raise_for_status()
+) as dag:
 
-    # Current timestamp (India timezone)
-    now_str = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
-    
-    csv_reader = csv.DictReader(io.StringIO(response.text))
-    
-    processed_data = []
-    for row in csv_reader:
-        # Skip fully empty rows
-        if not any(value.strip() for value in row.values() if value):
-            continue
-        row["read_timestamp"] = now_str
-        processed_data.append(row)
+    def read_google_sheet(**context):
+        """
+        Reads Google Sheets, saves as latest.json, and pushes filepath to XCom.
+        Logs top 5 rows for debugging.
+        """
 
-    print(f"Successfully read {len(processed_data)} non-empty rows from Google Sheets")
+        # Google Sheets API auth
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_json = Variable.get("GOOGLE_SHEETS_CREDENTIALS_JSON")  # Store creds in Airflow Variables
+        creds_dict = json.loads(creds_json)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
 
-    # 🔹 Show top 5 rows as preview
-    preview = processed_data[:5]
-    print("Preview of first 5 records:")
-    for i, row in enumerate(preview, start=1):
-        print(f"{i}: {row}")
+        # Get Sheet
+        spreadsheet_id = Variable.get("GOOGLE_SHEET_ID")
+        worksheet_name = Variable.get("GOOGLE_SHEET_WORKSHEET")
+        sheet = client.open_by_key(spreadsheet_id).worksheet(worksheet_name)
 
-    # Ensure data folder exists inside DAGs folder
-    save_dir = "/opt/airflow/dags/data"
-    os.makedirs(save_dir, exist_ok=True)
+        # Get data
+        data = sheet.get_all_records()
 
-    # Save to a timestamped JSON file
-    file_name = f"sheet_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    file_path = os.path.join(save_dir, file_name)
-    
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(processed_data, f, ensure_ascii=False)
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
 
-    print(f"Data saved to: {file_path}")
-    return file_path  # Pass path to next task
+        # Remove empty rows
+        df = df.dropna(how="all")
 
-def process_data(**context):
-    """
-    Read from file saved in previous task and process.
-    """
-    ti = context['ti']
-    file_path = ti.xcom_pull(task_ids='read_sheet_csv')
+        # Add timestamp column
+        df["read_timestamp"] = datetime.utcnow().isoformat()
 
-    if not file_path or not os.path.exists(file_path):
-        print("No file found from previous task")
-        return
-    
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        # Log top 5 rows
+        print("=== TOP 5 ROWS READ FROM GOOGLE SHEET ===")
+        print(df.head(5).to_string(index=False))
+        print("=========================================")
 
-    print(f"Processing {len(data)} rows from file: {file_path}")
-    print("Data processing completed - ready for staging table insert")
-    return f"Processed {len(data)} rows successfully"
+        # Save to latest.json
+        output_path = os.path.join(os.path.expanduser("~"), "latest.json")
+        df.to_json(output_path, orient="records", lines=False)
 
-# Define tasks
-read_task = PythonOperator(
-    task_id='read_sheet_csv',
-    python_callable=read_google_sheet_csv,
-    dag=dag,
-)
+        # Push file path to XCom
+        context["ti"].xcom_push(key="latest_json_path", value=output_path)
 
-process_task = PythonOperator(
-    task_id='process_data',
-    python_callable=process_data,
-    dag=dag,
-)
+    def process_data(**context):
+        """
+        Reads JSON file from XCom and processes the data.
+        """
+        file_path = context["ti"].xcom_pull(task_ids="read_google_sheet", key="latest_json_path")
 
-# Task dependencies
-read_task >> process_task
+        with open(file_path, "r") as f:
+            records = json.load(f)
+
+        df = pd.DataFrame(records)
+
+        # Just a placeholder processing step
+        print(f"Processing {len(df)} records...")
+        print(df.head(5).to_string(index=False))
+
+    read_google_sheet_task = PythonOperator(
+        task_id="read_google_sheet",
+        python_callable=read_google_sheet,
+        provide_context=True,
+    )
+
+    process_data_task = PythonOperator(
+        task_id="process_data",
+        python_callable=process_data,
+        provide_context=True,
+    )
+
+    read_google_sheet_task >> process_data_task
