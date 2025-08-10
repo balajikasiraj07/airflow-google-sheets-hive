@@ -1,0 +1,16 @@
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+services:
+  airflow-webserver:
+    volumes:
+      - ./google_credentials.json:/opt/airflow/google_credentials.json
+  airflow-worker:
+    volumes:
+      - ./google_credentials.json:/opt/airflow/google_credentials.json
+  airflow-scheduler:
+    volumes:
+      - ./google_credentials.json:/opt/airflow/google_credentials.json
